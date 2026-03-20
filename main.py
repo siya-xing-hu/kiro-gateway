@@ -83,6 +83,9 @@ from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
+# Qoder CLI Proxy imports
+from kiro.qoder import router as qoder_router
+
 
 # --- Loguru Configuration ---
 logger.remove()
@@ -205,18 +208,21 @@ def validate_configuration() -> None:
     Validates that required configuration is present.
     
     Checks:
-    - Either REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB_FILE is configured
+    - For Kiro: Either REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB_FILE is configured
+    - For Qoder: QODER_PERSONAL_ACCESS_TOKEN is configured (optional)
+    - At least one proxy (Kiro or Qoder) must be configured
     - Supports both .env file (local) and environment variables (Docker)
     
     Raises:
         SystemExit: If critical configuration is missing
     """
     errors = []
+    warnings = []
     
     # Check if .env file exists (optional - can use environment variables)
     env_file = Path(".env")
     
-    # Check for credentials (from .env or environment variables)
+    # Check for Kiro credentials (from .env or environment variables)
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE)
     has_cli_db = bool(KIRO_CLI_DB_FILE)
@@ -235,50 +241,74 @@ def validate_configuration() -> None:
             has_cli_db = False
             logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
     
-    # If no credentials found, show helpful error
-    if not has_refresh_token and not has_creds_file and not has_cli_db:
+    # Check for Kiro credentials
+    has_kiro_config = has_refresh_token or has_creds_file or has_cli_db
+    
+    # Check for Qoder CLI availability (not required, just check if installed)
+    has_qoder_config = True  # CLI proxy doesn't require token, just needs qodercli installed
+    
+    # If no credentials found for either proxy, show error
+    if not has_kiro_config and not has_qoder_config:
         if not env_file.exists():
             # No .env file and no environment variables
             errors.append(
-                "No Kiro credentials configured!\n"
+                "No credentials configured for any proxy!\n"
                 "\n"
                 "To get started:\n"
                 "1. Create .env file:\n"
                 "   cp .env.example .env\n"
                 "\n"
-                "2. Edit .env and configure your credentials:\n"
-                "   2.1. Set you super-secret password as PROXY_API_KEY\n"
-                "   2.2. Set your Kiro credentials:\n"
+                "2. Configure at least one proxy:\n"
+                "\n"
+                "   === Kiro Proxy ===\n"
+                "   Set your Kiro credentials:\n"
                 "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
                 "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
                 "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
                 "\n"
-                "Or use environment variables (for Docker):\n"
-                "   docker run -e PROXY_API_KEY=\"...\" -e REFRESH_TOKEN=\"...\" ...\n"
+                "   === Qoder Proxy ===\n"
+                "   Set your Qoder Personal Access Token:\n"
+                "      QODER_PERSONAL_ACCESS_TOKEN=\"your_token_here\"\n"
+                "      Get token from: https://qoder.com/account/integrations\n"
                 "\n"
                 "See README.md for detailed instructions."
             )
         else:
             # .env exists but no credentials configured
             errors.append(
-                "No Kiro credentials configured!\n"
+                "No credentials configured for any proxy!\n"
                 "\n"
-                "   Configure one of the following in your .env file:\n"
+                "   Configure at least one of the following in your .env file:\n"
                 "\n"
-                "Set you super-secret password as PROXY_API_KEY\n"
-                "   PROXY_API_KEY=\"my-super-secret-password-123\"\n"
+                "   === Kiro Proxy ===\n"
+                "      Option 1: KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
+                "      Option 2: REFRESH_TOKEN=\"your_refresh_token_here\"\n"
+                "      Option 3: KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
                 "\n"
-                "   Option 1 (Recommended): JSON credentials file\n"
-                "      KIRO_CREDS_FILE=\"path/to/your/kiro-credentials.json\"\n"
-                "\n"
-                "   Option 2: Refresh token\n"
-                "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
-                "\n"
-                "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
-                "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
+                "   === Qoder Proxy ===\n"
+                "      QODER_PERSONAL_ACCESS_TOKEN=\"your_token_here\"\n"
+                "      Get token from: https://qoder.com/account/integrations\n"
                 "\n"
                 "   See README.md for how to obtain credentials."
             )
+    
+    # Warn if only Qoder is configured (Kiro endpoints will be disabled)
+    if not has_kiro_config and has_qoder_config:
+        warnings.append(
+            "Kiro credentials not configured. Kiro proxy endpoints will be disabled.\n"
+            "Only Qoder proxy endpoints (/qoder/*) will be available."
+        )
+    
+    # Warn if only Kiro is configured (Qoder endpoints will be disabled)
+    if has_kiro_config and not has_qoder_config:
+        warnings.append(
+            "Qoder credentials not configured. Qoder proxy endpoints will be disabled.\n"
+            "Only Kiro proxy endpoints (/v1/*) will be available."
+        )
+    
+    # Print warnings
+    for warning in warnings:
+        logger.warning(warning)
     
     # Print errors and exit if any
     if errors:
@@ -313,6 +343,9 @@ async def lifespan(app: FastAPI):
     """
     logger.info("Starting application... Creating state managers.")
     
+    # Check which proxies are configured
+    has_kiro_config = bool(REFRESH_TOKEN or KIRO_CREDS_FILE or KIRO_CLI_DB_FILE)
+    
     # Create shared HTTP client with connection pooling
     # This reduces memory usage and enables connection reuse across requests
     # Limits: max 100 total connections, max 20 keep-alive connections
@@ -335,86 +368,98 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Shared HTTP client created with connection pooling")
     
-    # Create AuthManager
-    # Priority: SQLite DB > JSON file > environment variables
-    app.state.auth_manager = KiroAuthManager(
-        refresh_token=REFRESH_TOKEN,
-        profile_arn=PROFILE_ARN,
-        region=REGION,
-        creds_file=KIRO_CREDS_FILE if KIRO_CREDS_FILE else None,
-        sqlite_db=KIRO_CLI_DB_FILE if KIRO_CLI_DB_FILE else None,
-    )
-    
-    # Create model cache
-    app.state.model_cache = ModelInfoCache()
-    
-    # BLOCKING: Load models from Kiro API at startup
-    # This ensures the cache is populated BEFORE accepting any requests.
-    # No race conditions - requests only start after yield.
-    logger.info("Loading models from Kiro API...")
-    try:
-        token = await app.state.auth_manager.get_access_token()
-        from kiro.utils import get_kiro_headers
-        from kiro.auth import AuthType
-        headers = get_kiro_headers(app.state.auth_manager, token)
+    # Initialize Kiro proxy if configured
+    if has_kiro_config:
+        # Create AuthManager
+        # Priority: SQLite DB > JSON file > environment variables
+        app.state.auth_manager = KiroAuthManager(
+            refresh_token=REFRESH_TOKEN,
+            profile_arn=PROFILE_ARN,
+            region=REGION,
+            creds_file=KIRO_CREDS_FILE if KIRO_CREDS_FILE else None,
+            sqlite_db=KIRO_CLI_DB_FILE if KIRO_CLI_DB_FILE else None,
+        )
         
-        # Build params - profileArn is only needed for Kiro Desktop auth
-        params = {"origin": "AI_EDITOR"}
-        if app.state.auth_manager.auth_type == AuthType.KIRO_DESKTOP and app.state.auth_manager.profile_arn:
-            params["profileArn"] = app.state.auth_manager.profile_arn
+        # Create model cache
+        app.state.model_cache = ModelInfoCache()
         
-        list_models_url = f"{app.state.auth_manager.q_host}/ListAvailableModels"
-        logger.debug(f"Fetching models from: {list_models_url}")
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                list_models_url,
-                headers=headers,
-                params=params
-            )
+        # BLOCKING: Load models from Kiro API at startup
+        # This ensures the cache is populated BEFORE accepting any requests.
+        # No race conditions - requests only start after yield.
+        logger.info("Loading models from Kiro API...")
+        try:
+            token = await app.state.auth_manager.get_access_token()
+            from kiro.utils import get_kiro_headers
+            from kiro.auth import AuthType
+            headers = get_kiro_headers(app.state.auth_manager, token)
             
-            if response.status_code == 200:
-                data = response.json()
-                models_list = data.get("models", [])
-                await app.state.model_cache.update(models_list)
-                logger.debug(f"Successfully loaded {len(models_list)} models from Kiro API")
-            else:
-                raise Exception(f"HTTP {response.status_code}")
-    except Exception as e:
-        # FALLBACK: Use built-in model list
-        logger.error(f"Failed to fetch models from Kiro API: {e}")
-        logger.error("Using pre-configured fallback models. Not all models may be available on your plan, or the list may be outdated.")
+            # Build params - profileArn is only needed for Kiro Desktop auth
+            params = {"origin": "AI_EDITOR"}
+            if app.state.auth_manager.auth_type == AuthType.KIRO_DESKTOP and app.state.auth_manager.profile_arn:
+                params["profileArn"] = app.state.auth_manager.profile_arn
+            
+            list_models_url = f"{app.state.auth_manager.q_host}/ListAvailableModels"
+            logger.debug(f"Fetching models from: {list_models_url}")
+            
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    list_models_url,
+                    headers=headers,
+                    params=params
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    models_list = data.get("models", [])
+                    await app.state.model_cache.update(models_list)
+                    logger.debug(f"Successfully loaded {len(models_list)} models from Kiro API")
+                else:
+                    raise Exception(f"HTTP {response.status_code}")
+        except Exception as e:
+            # FALLBACK: Use built-in model list
+            logger.error(f"Failed to fetch models from Kiro API: {e}")
+            logger.error("Using pre-configured fallback models. Not all models may be available on your plan, or the list may be outdated.")
+            
+            # Populate cache with fallback models
+            await app.state.model_cache.update(FALLBACK_MODELS)
+            logger.debug(f"Loaded {len(FALLBACK_MODELS)} fallback models")
         
-        # Populate cache with fallback models
-        await app.state.model_cache.update(FALLBACK_MODELS)
-        logger.debug(f"Loaded {len(FALLBACK_MODELS)} fallback models")
+        # Add hidden models to cache (they appear in /v1/models but not in Kiro API)
+        # Hidden models are added ALWAYS, regardless of API success/failure
+        for display_name, internal_id in HIDDEN_MODELS.items():
+            app.state.model_cache.add_hidden_model(display_name, internal_id)
+        
+        if HIDDEN_MODELS:
+            logger.debug(f"Added {len(HIDDEN_MODELS)} hidden models to cache")
+        
+        # Log final cache state
+        all_models = app.state.model_cache.get_all_model_ids()
+        logger.info(f"Kiro model cache ready: {len(all_models)} models total")
+        
+        # Create model resolver (uses cache + hidden models + aliases for resolution)
+        app.state.model_resolver = ModelResolver(
+            cache=app.state.model_cache,
+            hidden_models=HIDDEN_MODELS,
+            aliases=MODEL_ALIASES,
+            hidden_from_list=HIDDEN_FROM_LIST
+        )
+        logger.info("Model resolver initialized")
+        
+        # Log alias configuration if any
+        if MODEL_ALIASES:
+            logger.debug(f"Model aliases configured: {list(MODEL_ALIASES.keys())}")
+        if HIDDEN_FROM_LIST:
+            logger.debug(f"Models hidden from list: {HIDDEN_FROM_LIST}")
+    else:
+        logger.info("Kiro proxy disabled (no credentials configured)")
     
-    # Add hidden models to cache (they appear in /v1/models but not in Kiro API)
-    # Hidden models are added ALWAYS, regardless of API success/failure
-    for display_name, internal_id in HIDDEN_MODELS.items():
-        app.state.model_cache.add_hidden_model(display_name, internal_id)
-    
-    if HIDDEN_MODELS:
-        logger.debug(f"Added {len(HIDDEN_MODELS)} hidden models to cache")
-    
-    # Log final cache state
-    all_models = app.state.model_cache.get_all_model_ids()
-    logger.info(f"Model cache ready: {len(all_models)} models total")
-    
-    # Create model resolver (uses cache + hidden models + aliases for resolution)
-    app.state.model_resolver = ModelResolver(
-        cache=app.state.model_cache,
-        hidden_models=HIDDEN_MODELS,
-        aliases=MODEL_ALIASES,
-        hidden_from_list=HIDDEN_FROM_LIST
-    )
-    logger.info("Model resolver initialized")
-    
-    # Log alias configuration if any
-    if MODEL_ALIASES:
-        logger.debug(f"Model aliases configured: {list(MODEL_ALIASES.keys())}")
-    if HIDDEN_FROM_LIST:
-        logger.debug(f"Models hidden from list: {HIDDEN_FROM_LIST}")
+    # Check Qoder CLI availability
+    from kiro.qoder.cli_client import get_cli_client
+    cli_client = get_cli_client()
+    if cli_client.is_available():
+        logger.info("Qoder CLI proxy initialized and ready")
+    else:
+        logger.warning("Qoder CLI proxy: qodercli command not found. Install from: https://docs.qoder.com/cli")
     
     yield
     
@@ -464,6 +509,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Qoder CLI Proxy API: /qoder/v1/models, /qoder/v1/chat/completions
+app.include_router(qoder_router, prefix="/qoder")
 
 
 # --- Uvicorn log config ---
