@@ -207,14 +207,31 @@ class QoderCliClient:
                             for content_item in content_list:
                                 if content_item.get("type") == "text":
                                     text = content_item.get("text", "")
+                                    # Ensure text is a string
+                                    if isinstance(text, list):
+                                        text = "".join(str(t) for t in text)
+                                    elif not isinstance(text, str):
+                                        text = str(text)
                                     if text:
                                         yield text
                         
                         # Fallback: check for simple content/text fields (for other formats)
-                        elif "content" in data and isinstance(data["content"], str):
-                            yield data["content"]
-                        elif "text" in data and isinstance(data["text"], str):
-                            yield data["text"]
+                        elif "content" in data:
+                            content = data["content"]
+                            if isinstance(content, list):
+                                yield "".join(str(c) for c in content)
+                            elif isinstance(content, str):
+                                yield content
+                            else:
+                                yield str(content)
+                        elif "text" in data:
+                            text = data["text"]
+                            if isinstance(text, list):
+                                yield "".join(str(t) for t in text)
+                            elif isinstance(text, str):
+                                yield text
+                            else:
+                                yield str(text)
                             
                     except json.JSONDecodeError:
                         # Not JSON, yield as-is
@@ -233,7 +250,7 @@ class QoderCliClient:
             logger.error(f"Failed to execute qodercli: {e}")
             raise
     
-    def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
+    def _build_prompt(self, messages: List[Dict[str, Any]]) -> str:
         """
         Build a prompt string from messages.
         
@@ -247,6 +264,19 @@ class QoderCliClient:
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            
+            # Handle case where content might be a list (OpenAI format with mixed content)
+            if isinstance(content, list):
+                # Extract text from content items
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif isinstance(item, str):
+                        text_parts.append(item)
+                content = "".join(text_parts)
+            elif not isinstance(content, str):
+                content = str(content)
             
             if role == "system":
                 parts.append(f"[System: {content}]")
